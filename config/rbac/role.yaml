@@ -1,0 +1,33 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  creationTimestamp: null
+  name: manager-role
+rules:
+- apiGroups:
+  - lbhc.cloud.edge
+  resources:
+  - lbhcs
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - lbhc.cloud.edge
+  resources:
+  - lbhcs/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - lbhc.cloud.edge
+  resources:
+  - lbhcs/status
+  verbs:
+  - get
+  - patch
+  - update

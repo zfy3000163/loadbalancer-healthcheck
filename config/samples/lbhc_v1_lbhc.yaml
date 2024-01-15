@@ -1,0 +1,16 @@
+apiVersion: lbhc.cloud.edge/v1
+kind: Lbhc
+metadata:
+  name: lbhc-sample
+  labels:
+    network.kubernetes.io: virtual-service
+spec:
+  # TODO(user): Add fields here
+  down_ep_list:
+    #svc_1:
+    #  192.168.0.1:90: true
+    #  192.168.0.1:91: true
+    #svc_2:
+    #  192.168.0.2:90: true
+    #  192.168.0.2:91: true
+      

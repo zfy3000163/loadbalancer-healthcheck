@@ -1,0 +1,197 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.8.0
+  creationTimestamp: null
+  name: lbhcs.lbhc.cloud.edge
+spec:
+  group: lbhc.cloud.edge
+  names:
+    kind: Lbhc
+    listKind: LbhcList
+    plural: lbhcs
+    singular: lbhc
+  scope: Namespaced
+  versions:
+  - name: v1
+    schema:
+      openAPIV3Schema:
+        description: Lbhc is the Schema for the lbhcs API
+        properties:
+          apiVersion:
+            description: 'APIVersion defines the versioned schema of this representation
+              of an object. Servers should convert recognized schemas to the latest
+              internal value, and may reject unrecognized values. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources'
+            type: string
+          kind:
+            description: 'Kind is a string value representing the REST resource this
+              object represents. Servers may infer this from the endpoint the client
+              submits requests to. Cannot be updated. In CamelCase. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds'
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: LbhcSpec defines the desired state of Lbhc
+            properties:
+              down_ep_list:
+                additionalProperties:
+                  additionalProperties:
+                    type: boolean
+                  type: object
+                type: object
+            type: object
+          status:
+            description: LbhcStatus defines the observed state of Lbhc
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+status:
+  acceptedNames:
+    kind: ""
+    plural: ""
+  conditions: []
+  storedVersions: []
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: lbhc-controller-sa
+  namespace: hci-network-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  creationTimestamp: null
+  name: lbhc-controller-manager-role
+rules:
+  - apiGroups: ["lbhc.cloud.edge"]
+    resources: ["lbhcs", "lbhcs/status", "lbhcs/finalizers"]
+    verbs: ["create", "list","get","watch", "update", "delete"]
+  - apiGroups: [""]
+    resources: ["services", "services/status", "nodes", "endpoints", "pods"]
+    verbs: ["list","get","watch", "update", "create", "delete"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["list", "get", "watch", "update", "create", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: lbhc-controller-manager-rolebinding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: lbhc-controller-manager-role
+subjects:
+- kind: ServiceAccount
+  name: lbhc-controller-sa
+  namespace: hci-network-system
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: lbhc-nginx-conf
+  namespace: hci-network-system
+data:
+  nginx.conf: "\n#user  nginx;\nworker_processes  2;\n\n#error_log  /var/local/nginx/log/error.log
+    warn;\npid        /usr/local/nginx/nginx.pid;\n\n\nevents {\n    worker_connections
+    \ 4096;\n}\n\n\nhttp {\n    #include       /etc/nginx/mime.types;\n    default_type
+    \ application/octet-stream;\n\n    log_format  main  '$remote_addr - $remote_user
+    [$time_local] \"$request\" '\n                      '$status $body_bytes_sent
+    \"$http_referer\" '\n                      '\"$http_user_agent\" \"$http_x_forwarded_for\"';\n\n
+    \   #access_log  /var/log/cloudify/nginx/access.log  main;\n    sendfile        on;\n\n
+    \   keepalive_timeout  65;\n\n    proxy_connect_timeout 300s;\n    proxy_send_timeout
+    300s;\n    proxy_read_timeout 300s;\n\n    #add_header Referrer-Policy same-origin
+    always;\n    #add_header X-Content-Type-Options \"nosniff\" always;\n\n\n    server
+    {\n      listen 8000;\n\n\n      location /status {\n        healthcheck_status
+    json;\n        #check_status json;\n\n        access_log   off;\n      }\n\n      location
+    / {\n        root   html;\n        index  index.html index.htm;\n      }\n\n    \n
+    \   }\n   \n    include /usr/local/nginx/conf/conf.d/*.conf;\n}\n\nstream {\n\n
+    \ include /usr/local/nginx/conf/conf.d/stream/*.conf;\n\n}\n\n"
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: lbhc-controller
+  namespace: hci-network-system
+  labels:
+    app: lbhc-controller
+spec:
+  selector:
+    matchLabels:
+      app: lbhc-controller
+  template:
+    metadata:
+      labels:
+        app: lbhc-controller
+    spec:      
+      serviceAccountName: lbhc-controller-sa
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: kubernetes.io/os
+                operator: In
+                values:
+                - linux
+              - key: node-role.kubernetes.io/agent
+                operator: DoesNotExist
+      containers:
+      - name: lbhc-controller
+        image: harbor.lenovo.com/lecp/mec/lbhc-controller:latest
+        imagePullPolicy: IfNotPresent
+        args:
+          - --dep-is-cluster=true
+          - --ngx-port=8000
+        resources:
+          requests:
+            memory: "30Mi"
+            cpu: "10m"
+          limits:
+            memory: "100Mi"
+            cpu: "100m"
+        livenessProbe:
+          failureThreshold: 5
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          successThreshold: 1
+          tcpSocket:
+            port: 8000
+          timeoutSeconds: 3
+        readinessProbe:
+          failureThreshold: 5
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          successThreshold: 1
+          tcpSocket:
+            port: 8000
+          timeoutSeconds: 3
+        env:
+          - name: POD_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.name
+          - name: KUBE_NAMESPACE
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.namespace
+          - name: KUBE_NODE_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: spec.nodeName
+        volumeMounts:
+          - name: lbhc-nginx-conf
+            mountPath: /usr/local/nginx/conf/nginx.conf
+            subPath: nginx.conf
+      volumes:
+        - name: lbhc-nginx-conf
+          configMap:
+            defaultMode: 420
+            name: lbhc-nginx-conf
+          

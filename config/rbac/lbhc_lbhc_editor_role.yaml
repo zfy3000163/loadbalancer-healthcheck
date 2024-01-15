@@ -1,0 +1,24 @@
+# permissions for end users to edit lbhcs.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: lbhc-editor-role
+rules:
+- apiGroups:
+  - lbhc.cloud.edge
+  resources:
+  - lbhcs
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - lbhc.cloud.edge
+  resources:
+  - lbhcs/status
+  verbs:
+  - get

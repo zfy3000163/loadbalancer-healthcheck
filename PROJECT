@@ -1,0 +1,17 @@
+domain: cloud.edge
+layout:
+- go.kubebuilder.io/v3
+multigroup: true
+projectName: lbhc-controller
+repo: cloud.edge/lbhc-controller
+resources:
+- api:
+    crdVersion: v1
+    namespaced: true
+  controller: true
+  domain: cloud.edge
+  group: lbhc
+  kind: Lbhc
+  path: cloud.edge/lbhc-controller/apis/lbhc/v1
+  version: v1
+version: "3"
