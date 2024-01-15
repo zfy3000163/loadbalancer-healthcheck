@@ -24,9 +24,11 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"k8s.io/klog/v2"
@@ -71,6 +73,7 @@ var (
 	GlobalSvcLeaseDetail                               map[string]string
 	GlobalSvcIsLb                                      map[string]bool
 	GlobalHostName                                     string
+	GlobalShutDown                                     bool = false
 	CrdName, CrdNamespace                              string
 	SyncFrequency, WaitSetDownFrequency                time.Duration
 	NgxServiceAddress, NgxServicePort, NgxServiceHcUrl string
@@ -215,6 +218,8 @@ func (r *LbhcReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		if endpoints.Labels[VsHcIsEnable] == "true" {
 			klog.Infof("endpoints hc enable:%s\n", endpoints.Labels[VsHcIsEnable])
 
+			syncLbhcWithEndpoints(endpoints.Name, endpoints.Namespace)
+
 			err = delServerInNginxUpstream(fmt.Sprintf("%s_%s", endpoints.Name, endpoints.Namespace))
 			if err != nil {
 				return ctrl.Result{}, err
@@ -249,11 +254,17 @@ func (r *LbhcReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	if err := r.Get(ctx, req.NamespacedName, svc); err == nil {
 		klog.Infof("svc change name:%s, namespace:%s\n", svc.Name, svc.Namespace)
 
-		err := syncSvcLabelToEp(svc.Name, svc.Namespace, svc)
+		cacheSvcDetail(svc)
+
+		err = syncSvcLabelToEp(svc.Name, svc.Namespace, svc)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
 
+		err := createEpBaseSvc(svc)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	pod := &corev1.Pod{}
@@ -294,6 +305,23 @@ func (r *LbhcReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	LbHcClient = r.Client
 	Kubeclient = r.Kubeclient
 	Elect = LeaderElection()
+
+	signalChan := make(chan os.Signal, 1)
+	// Add Notification for Userland interrupt
+	signal.Notify(signalChan, syscall.SIGINT)
+
+	// Add Notification for SIGTERM (sent from Kubernetes)
+	signal.Notify(signalChan, syscall.SIGTERM)
+
+	// Add Notification for SIGKILL (sent from Kubernetes)
+	//nolint
+	signal.Notify(signalChan, syscall.SIGKILL)
+	go func() {
+		<-signalChan
+		GlobalShutDown = true
+		klog.Fatal("Received termination, signaling shutdown")
+	}()
+
 	GlobalHostName = os.Getenv("KUBE_NODE_NAME")
 	if os.Getenv("DEPLOY_MODE") == "single" {
 		DeployIsCluster = false
@@ -322,13 +350,16 @@ func (rl *ResourceOptChangedPredicate) Update(evt event.UpdateEvent) bool {
 		epLabels := newObj.GetLabels()
 		if _, ok := epLabels[VsDomain]; ok {
 			if newObj.ResourceVersion != oldObj.ResourceVersion {
+
 				newSvcName := fmt.Sprintf(VirtualServiceFullValue, newObj.Name, newObj.Namespace)
 				if GlobalHostName == GlobalSvcLeaseDetail[newSvcName] || Elect.isLeader() {
+
 					klog.Infof("epName: %s namespace: %s Update...", newObj.Name, newObj.Namespace)
+
 					if !compareEpSubsets(newObj.Subsets, oldObj.Subsets) ||
 						!compareMapsStrings(newObj.Labels, oldObj.Labels) {
 						klog.Infof("epName: %s namespace: %s is change!", newObj.Name, newObj.Namespace)
-						syncLbhcWithEndpoints(newObj.Name, newObj.Namespace)
+						return true
 					} else {
 						klog.Infof("epName: %s namespace: %s is not change!", newObj.Name, newObj.Namespace)
 						return false
@@ -380,9 +411,10 @@ func (rl *ResourceOptChangedPredicate) Update(evt event.UpdateEvent) bool {
 				newPodObj.Status.PodIP != "" &&
 				newPodObj.DeletionTimestamp == nil &&
 				newPodObj.Annotations[AnnotationFt] != "svm" {
-				klog.Infof("podName: %s namespace: %s Update...", newPodObj.Name, oldPodObj.Namespace)
-				var isNewPodLabelHit, isOldPodLabelHit bool
 
+				klog.Infof("podName: %s namespace: %s Update...", newPodObj.Name, oldPodObj.Namespace)
+
+				var isNewPodLabelHit, isOldPodLabelHit bool
 				newPodLabels := newPodObj.GetLabels()
 				for l, _ := range newPodLabels {
 					if strings.Contains(l, VsAppLabelPrefix) {
@@ -398,7 +430,9 @@ func (rl *ResourceOptChangedPredicate) Update(evt event.UpdateEvent) bool {
 				}
 
 				if isNewPodLabelHit || isOldPodLabelHit {
+
 					klog.Infof("podName: %s namespace: %s Hit", newPodObj.Name, oldPodObj.Namespace)
+
 					err := syncEndpointsWithPodLabel(newPodObj, oldPodObj)
 					if err != nil {
 						klog.Error(err)
@@ -418,7 +452,9 @@ func (rl *ResourceOptChangedPredicate) Update(evt event.UpdateEvent) bool {
 		if isPrefix {
 			if newLeaseObj.ResourceVersion != oldLeaseObj.ResourceVersion &&
 				*newLeaseObj.Spec.HolderIdentity != *oldLeaseObj.Spec.HolderIdentity {
+
 				klog.Infof("Lease %s-%s Update\n", newLeaseObj.Name, newLeaseObj.Namespace)
+
 				if newLeaseObj.Spec.HolderIdentity != nil {
 					tempLeaseName := strings.Split(newLeaseObj.Name, "kubevip-")
 					if len(tempLeaseName) != 2 {
@@ -442,7 +478,9 @@ func (rl *ResourceOptChangedPredicate) Update(evt event.UpdateEvent) bool {
 					}
 					GlobalSvcLeaseDetail[leaseName] = ""
 				}
+
 				klog.V(5).Infof("Lease %s-%s Update success\n", newLeaseObj.Name, newLeaseObj.Namespace)
+
 				return true
 			}
 		}
@@ -457,7 +495,9 @@ func (rl *ResourceOptChangedPredicate) Create(evt event.CreateEvent) bool {
 	if ok1 {
 		epLabels := epObj.GetLabels()
 		if _, ok := epLabels[VsDomain]; ok {
+
 			klog.Infof("epName: %s namespace: %s Create...", epObj.Name, epObj.Namespace)
+
 			return true
 		}
 	}
@@ -466,7 +506,9 @@ func (rl *ResourceOptChangedPredicate) Create(evt event.CreateEvent) bool {
 	if ok2 {
 		hcLabels := hcObj.GetLabels()
 		if _, ok := hcLabels[VsDomain]; ok {
+
 			klog.Info("Lbhc Create\n")
+
 			return true
 		}
 	}
@@ -475,16 +517,7 @@ func (rl *ResourceOptChangedPredicate) Create(evt event.CreateEvent) bool {
 	if ok3 {
 		svcLabels := svcObj.GetLabels()
 		if _, ok := svcLabels[VsDomain]; ok {
-			svcName := svcObj.Name
-			svcNameSpace := svcObj.Namespace
-			klog.Infof("svcName: %s namespace: %s Create...", svcName, svcNameSpace)
-
-			cacheSvcDetail(svcObj)
-
-			err := createEpBaseSvc(svcObj)
-			klog.Error(err)
-
-			return err == nil
+			return true
 		}
 	}
 
@@ -494,27 +527,14 @@ func (rl *ResourceOptChangedPredicate) Create(evt event.CreateEvent) bool {
 			podLabels := podObj.GetLabels()
 			for lk, _ := range podLabels {
 				if strings.Contains(lk, VsAppLabelPrefix) {
+
 					klog.Infof("podName: %s namespace: %s Create...", podObj.Name, podObj.Namespace)
+
 					metaKey := strings.Split(lk, "/")
 					if len(metaKey) == 2 {
 						metaEndpoint := strings.Split(metaKey[1], "_")
 						if len(metaEndpoint) == 2 {
-							svcName := metaEndpoint[0]
-							svcNameSpace := metaEndpoint[1]
-							podName := podObj.Name
-							podNameSpace := podObj.Namespace
-							podIp := podObj.Status.PodIP
-							nodeName := podObj.Spec.NodeName
-
-							svc, err := Kubeclient.CoreV1().Services(svcNameSpace).Get(context.TODO(), svcName, metav1.GetOptions{})
-							if err != nil {
-								klog.Errorf("get svc Error: %s", err)
-								return true
-							}
-							err = createEpInfo(svc, podName, podNameSpace, podIp, nodeName)
-							if err != nil {
-								klog.Errorf("update endpoints error: %v\n", err)
-							}
+							return true
 						}
 					}
 				}
@@ -526,7 +546,9 @@ func (rl *ResourceOptChangedPredicate) Create(evt event.CreateEvent) bool {
 	if ok5 {
 		isPrefix := strings.HasPrefix(leaseObj.Name, "kubevip-")
 		if isPrefix {
+
 			klog.Infof("Lease %s-%s Update\n", leaseObj.Name, leaseObj.Namespace)
+
 			if leaseObj.Spec.HolderIdentity != nil {
 				tempLeaseName := strings.Split(leaseObj.Name, "kubevip-")
 				if len(tempLeaseName) != 2 {
@@ -548,7 +570,9 @@ func (rl *ResourceOptChangedPredicate) Create(evt event.CreateEvent) bool {
 				}
 				GlobalSvcLeaseDetail[leaseName] = ""
 			}
+
 			klog.V(5).Infof("Lease %s-%s Update success\n", leaseObj.Name, leaseObj.Namespace)
+
 			return true
 		}
 	}
@@ -567,7 +591,9 @@ func (rl *ResourceOptChangedPredicate) Delete(evt event.DeleteEvent) bool {
 	if ok1 {
 		epLabels := epObj.GetLabels()
 		if _, ok := epLabels[VsDomain]; ok {
+
 			klog.Infof("epName: %s namespace: %s Delete...", epObj.Name, epObj.Namespace)
+
 			svcName := fmt.Sprintf("%s_%s", epObj.Name, epObj.Namespace)
 
 			err := delServerInNginxUpstream(svcName)
@@ -598,7 +624,9 @@ func (rl *ResourceOptChangedPredicate) Delete(evt event.DeleteEvent) bool {
 		podLabels := podObj.GetLabels()
 		for lk, _ := range podLabels {
 			if strings.Contains(lk, VsAppLabelPrefix) {
+
 				klog.Infof("podName: %s namespace: %s Delete...", podObj.Name, podObj.Namespace)
+
 				metaKey := strings.Split(lk, "/")
 				if len(metaKey) == 2 {
 					metaEndpoint := strings.Split(metaKey[1], "_")
@@ -606,20 +634,15 @@ func (rl *ResourceOptChangedPredicate) Delete(evt event.DeleteEvent) bool {
 						podIp := podObj.Status.PodIP
 						epName := metaEndpoint[0]
 						epNameSpace := metaEndpoint[1]
-						//podName := newPodObj.Name
-						//podNameSpace := newPodObj.Namespace
-						//nodeName := newPodObj.Spec.NodeName
+
 						err := deleteEp(epName, epNameSpace, podIp)
 						if err != nil {
 							klog.Errorf("delete endpoints error: %v\n", err)
-							//return false
 						}
 					}
 				}
 			}
-
 		}
-
 	}
 
 	return false
@@ -684,6 +707,7 @@ func compareMaps(new map[string]map[string]bool, old map[string]map[string]bool)
 	if new == nil || old == nil {
 		return false
 	}
+
 	keySlice := make([]map[string]string, 0)
 
 	dataSlice1 := make([]interface{}, 0)
@@ -1875,6 +1899,16 @@ func delServerInNginxUpstream(name string) error {
 }
 
 func reloadNgx() error {
+	if GlobalShutDown {
+		cmd := exec.Command(NgxBin, "-s", "stop")
+		var stdout, stderr strings.Builder
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+		if err := cmd.Run(); err != nil {
+			klog.Infof("stop nginx error %v", err)
+		}
+	}
+
 	cmd := exec.Command(NgxBin, "-s", "reload")
 	var stdout, stderr strings.Builder
 	cmd.Stdout = &stdout
@@ -1931,17 +1965,14 @@ func syncEndpointsWithPodLabel(newPodObj, oldPodObj *corev1.Pod) error {
 		}
 	}
 
-	labelIsSame := true
 	for _, key := range newLabelKey {
-		if _, ok := oldPodLabels[key]; !ok { //add
-			labelIsSame = false
+		if _, ok := oldPodLabels[key]; ok { //mod
+			klog.Infof("podName:%s is mod\n", newPodObj.Name)
+			return nil
+		} else if _, ok := oldPodLabels[key]; !ok { //add
 			klog.Infof("podName:%s is add\n", newPodObj.Name)
 			return nil
 		}
-	}
-	if labelIsSame && (len(oldLabelKey) == len(newLabelKey)) {
-		klog.Infof("podName:%s is mod\n", newPodObj.Name)
-		return nil
 	}
 
 	for _, key := range oldLabelKey {
@@ -2020,39 +2051,27 @@ func deleteEp(epName, epNameSpace, podIp string) error {
 	}
 
 	var isFind bool = false
-	tmpNotReadyAddress := make([]corev1.EndpointAddress, 0)
-	tmpAddress := make([]corev1.EndpointAddress, 0)
 	for index, sub := range k8sEndpoints.Subsets {
-		for _, addr := range sub.Addresses {
+		for i, addr := range sub.Addresses {
 			if addr.IP == podIp {
 				isFind = true
-				//k8sEndpoints.Subsets[index].Addresses =
-				//	append(k8sEndpoints.Subsets[index].Addresses[:i], k8sEndpoints.Subsets[index].Addresses[i+1:]...)
-				//break
-			} else {
-				tmpAddress = append(tmpAddress, addr)
+				k8sEndpoints.Subsets[index].Addresses =
+					append(k8sEndpoints.Subsets[index].Addresses[:i], k8sEndpoints.Subsets[index].Addresses[i+1:]...)
+
+				break
 			}
 		}
-		k8sEndpoints.Subsets[index].Addresses = tmpAddress
 
 		if !isFind {
-			for _, addr := range sub.NotReadyAddresses {
+			for i, addr := range sub.NotReadyAddresses {
 				if addr.IP == podIp {
 					isFind = true
-					//k8sEndpoints.Subsets[index].NotReadyAddresses =
-					//	append(k8sEndpoints.Subsets[index].NotReadyAddresses[:i], k8sEndpoints.Subsets[index].NotReadyAddresses[i+1:]...)
-					//break
-				} else {
-					tmpNotReadyAddress = append(tmpNotReadyAddress, addr)
+					k8sEndpoints.Subsets[index].NotReadyAddresses =
+						append(k8sEndpoints.Subsets[index].NotReadyAddresses[:i], k8sEndpoints.Subsets[index].NotReadyAddresses[i+1:]...)
+
+					break
 				}
 			}
-			k8sEndpoints.Subsets[index].NotReadyAddresses = tmpNotReadyAddress
-		}
-	}
-
-	for index, sub := range k8sEndpoints.Subsets {
-		if len(sub.NotReadyAddresses) == 0 && len(sub.Addresses) == 0 {
-			k8sEndpoints.Subsets = append(k8sEndpoints.Subsets[:index], k8sEndpoints.Subsets[index+1:]...)
 		}
 	}
 
